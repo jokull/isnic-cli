@@ -2,6 +2,10 @@
   "name": "isnic-cli",
   "version": "0.1.0",
   "description": "Read-only CLI for ISNIC (.is registry) using the public RDAP API: list your domains, check availability, whois lookups.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jokull/isnic-cli.git"
+  },
   "type": "module",
   "bin": {
     "isnic": "./bin/isnic.mjs"
