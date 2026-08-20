@@ -24,7 +24,7 @@
  *   4. ~/.config/isnic/config.json  { "handle": "...", "password": "..." | "apiKey": "..." }
  */
 import { domainToASCII } from 'node:url';
-import { readFileSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
@@ -44,6 +44,7 @@ Usage:
   isnic whois <query>            Lookup: domain, contact handle, or nameserver
   isnic ispstat                  DNS-provider domain list (auth required; may be denied)
   isnic keychain <add|remove|status>  Store/read the secret in the macOS Keychain
+                                       (add also remembers your handle as the default)
   isnic config                   Show credential source / status
   isnic help                     This help
 
@@ -54,8 +55,10 @@ Options:
   -h, --help                     This help
 
 Credentials precedence: flags > env vars > macOS Keychain (ISNIC_KEYCHAIN=1)
-> ~/.config/isnic/config.json. Password auth is rejected when TOTP 2FA is on —
-use an API key instead (isnic keychain add --api-key).
+> ~/.config/isnic/config.json. \`isnic keychain add\` prompts for the handle if
+unset and persists it (with keychain:true) to the config file, so afterwards
+\`isnic list\` works with no environment variables. Password auth is rejected
+when TOTP 2FA is on — use an API key instead (isnic keychain add --api-key).
 
 Rate limits (documented): domain/entity lookups 50 req / 30 min (own domains exempt when
 authenticated), nameserver 1500 req / h, availability check 7200 req / 30 min.
@@ -132,22 +135,39 @@ function keychainDelete(service, account) {
   }
 }
 
-/** Prompt for a secret without echoing it to the terminal (TTY only; piped stdin passes through). */
-function promptSecret(prompt) {
-  return new Promise((resolve) => {
-    const terminal = process.stdin.isTTY && process.stdout.isTTY;
-    const rl = createInterface({ input: process.stdin, output: process.stdout, terminal });
-    if (terminal) {
-      rl._writeToOutput = function (s) {
-        if (s === prompt) rl.output.write(s);
-        else rl.output.write('\x1b[2K\r' + prompt + '*'.repeat(s.length));
-      };
-    }
-    rl.question(prompt, (answer) => {
-      rl.close();
-      resolve(answer);
+/**
+ * Prompt for input. On a TTY: prints the prompt, hides typed characters when
+ * `mask` is set. On piped stdin: consumes the next line of the pipe (used for
+ * scripting, e.g. `printf 'JSA5-IS\nsecret\n' | isnic keychain add`).
+ */
+let _pipedLines = null;
+function readPipedLines() {
+  if (_pipedLines === null) {
+    _pipedLines = readFileSync(0, 'utf8').split(/\r?\n/);
+  }
+  return _pipedLines;
+}
+
+function prompt(msg, { mask = false } = {}) {
+  if (process.stdin.isTTY && process.stdout.isTTY) {
+    return new Promise((resolve) => {
+      const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+      if (mask) {
+        rl._writeToOutput = function (s) {
+          if (s === msg) rl.output.write(s);
+          else rl.output.write('\x1b[2K\r' + msg + '*'.repeat(s.length));
+        };
+      }
+      rl.question(msg, (answer) => {
+        rl.close();
+        resolve(answer.trim());
+      });
     });
-  });
+  }
+  const lines = readPipedLines();
+  const next = lines.shift() ?? '';
+  if (mask) process.stderr.write(msg + '\n');
+  return Promise.resolve(next.trim());
 }
 
 function keychainEnabled(env) {
@@ -183,6 +203,31 @@ function getConfig() {
     env.fromKeychain = !!(key || pw);
   }
   return env;
+}
+
+/**
+ * Persist the default handle (+ keychain:true) to ~/.config/isnic/config.json
+ * so `keychain status` / `remove` and `list` work without ISNIC_HANDLE.
+ * The handle is not a secret; only the secret itself stays in the Keychain.
+ * Existing fields (e.g. apiKey) are preserved. Never fails the caller.
+ */
+function writeConfigHandle(handle) {
+  try {
+    const dir = join(homedir(), '.config', 'isnic');
+    mkdirSync(dir, { recursive: true });
+    let cfg = {};
+    if (existsSync(CONFIG_PATH)) {
+      try { cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')); } catch { /* start fresh */ }
+    }
+    cfg.handle = handle;
+    cfg.keychain = true;
+    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+    chmodSync(CONFIG_PATH, 0o600);
+    return true;
+  } catch (e) {
+    console.error(dim(`warning: could not write default handle to ${CONFIG_PATH}: ${e.message}`));
+    return false;
+  }
 }
 
 function authHeader(env) {
@@ -455,25 +500,46 @@ async function cmdKeychain({ env }, args) {
   const sub = args[0];
   const useKey = args.includes('--api-key');
   const service = useKey ? KEYCHAIN_SERVICE_KEY : KEYCHAIN_SERVICE;
-  const handle = env.handle;
-  if (!handle) fail('set ISNIC_HANDLE (or --handle) first so the item can be keyed to it', 2);
+
+  // Resolve the handle: flags/env/config, or prompt on `add` (piped stdin supported).
+  let handle = env.handle;
+  if (!handle && sub === 'add') {
+    handle = await prompt('NIC handle: ');
+    if (!handle) fail('no NIC handle given, aborting');
+  } else if (!handle) {
+    handle = env.file?.handle;
+  }
 
   if (sub === 'add') {
-    const secret = await promptSecret(useKey ? 'API key: ' : 'Password: ');
+    if (!handle) fail('no NIC handle configured — set ISNIC_HANDLE (or --handle)', 2);
+    const secret = await prompt(useKey ? 'API key: ' : 'Password: ', { mask: true });
     if (!secret) fail('empty secret, aborting');
     keychainSet(service, handle, secret);
+    // Remember the default: handle + keychain:true in a 0600 config file, so
+    // `list`/`keychain status`/`remove` work without ISNIC_HANDLE or ISNIC_KEYCHAIN.
+    writeConfigHandle(handle);
     console.log(green(`stored ${useKey ? 'API key' : 'password'} for ${handle} in the macOS Keychain (service "${service}")`));
-    console.log(dim('Enable it with ISNIC_KEYCHAIN=1 (or {"keychain":true} in ~/.config/isnic/config.json).'));
+    if (env.file?.handle !== handle || !env.file?.keychain) {
+      console.log(dim(`defaults written to ${CONFIG_PATH}: handle=${handle}, keychain=true`));
+    }
     return;
   }
   if (sub === 'remove') {
+    if (!handle) fail('no NIC handle configured — set ISNIC_HANDLE (or --handle)', 2);
     const removed = keychainDelete(service, handle);
     console.log(removed ? dim(`removed ${service}/${handle}`) : dim(`nothing stored for ${service}/${handle}`));
     return;
   }
   if (sub === 'status' || sub === undefined) {
-    const pw = keychainGet(KEYCHAIN_SERVICE, handle);
-    const key = keychainGet(KEYCHAIN_SERVICE_KEY, handle);
+    const lookup = handle || env.file?.handle;
+    if (!lookup) {
+      console.log('keychain:   ' + (keychainEnabled(env) ? green('enabled') : dim('off')) + ' (ISNIC_KEYCHAIN=1 or {"keychain":true})');
+      console.log(dim('no NIC handle configured — run `isnic keychain add` to store one, or set ISNIC_HANDLE'));
+      return;
+    }
+    const pw = keychainGet(KEYCHAIN_SERVICE, lookup);
+    const key = keychainGet(KEYCHAIN_SERVICE_KEY, lookup);
+    console.log(`handle:     ${cyan(lookup)}`);
     console.log(`keychain:   ${keychainEnabled(env) ? green('enabled') : dim('off')} (ISNIC_KEYCHAIN=1 or {"keychain":true})`);
     console.log(`password:   ${pw ? green('stored') : dim('not stored')}  (service "${KEYCHAIN_SERVICE}")`);
     console.log(`api key:    ${key ? green('stored') : dim('not stored')}  (service "${KEYCHAIN_SERVICE_KEY}")`);

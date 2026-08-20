@@ -40,19 +40,29 @@ Credentials — HTTP Basic with your NIC handle as user and your **password**
 
 ### macOS Keychain
 
-```sh
-isnic keychain add            # stores your password (hidden input, upsert)
-isnic keychain add --api-key  # stores an RDAP/RPP API key instead (needed if 2FA is on)
-isnic keychain status         # what's stored
-isnic keychain remove         # delete the entry
+First run (prompts for handle if unset, then the password):
 
-ISNIC_KEYCHAIN=1 isnic list   # enable keychain lookup for the command
+```sh
+isnic keychain add            # prompts: NIC handle + password (hidden input, upsert)
+isnic keychain add --api-key  # stores an RDAP/RPP API key instead (needed if 2FA is on)
+isnic keychain status         # what's stored / enabled
+isnic keychain remove         # delete the entry
 ```
 
-Keychain lookup is only active when `ISNIC_KEYCHAIN=1` or the config file has
-`{"keychain": true}` — so anonymous commands like `check` never trigger a
-Keychain access prompt. Items are stored under services `isnic-cli`
-(password) and `isnic-cli-api` (API key), keyed by your NIC handle.
+`isnic keychain add` also writes your handle and `"keychain": true` to
+`~/.config/isnic/config.json` (0600 — the handle isn't a secret, the secret
+stays in the Keychain), so after that **`isnic list` works with no
+environment variables at all**:
+
+```sh
+isnic list
+```
+
+Scripted / piped input is supported (`printf 'JSA5-IS\nsecret\n' | isnic keychain add`).
+Keychain lookup is otherwise opt-in (`ISNIC_KEYCHAIN=1`, or `{"keychain": true}`
+in the config) so anonymous commands like `check` never trigger a Keychain
+access prompt. Items are stored under services `isnic-cli` (password) and
+`isnic-cli-api` (API key), keyed by your NIC handle.
 
 > ⚠️ If TOTP 2FA is enabled on the account, password auth is **rejected** by
 > the registry — create an RDAP/RPP API key in the account web UI
